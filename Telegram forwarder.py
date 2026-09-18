@@ -7,18 +7,18 @@ from telethon.sessions import StringSession
 from tqdm.asyncio import tqdm
 
 # ==========================================
-# 0. MOUNT GOOGLE DRIVE FOR PERSISTENT STATE
+# 0. MOUNT GOOGLE DRIVE & SILENCE NOISE
 # ==========================================
 drive.mount('/content/drive')
 
-# Suppress Telethon's internal connection warnings
+# Mute Telethon warnings and Python 3.13 asyncio task cancellation noise
 logging.getLogger('telethon').setLevel(logging.ERROR)
 logging.getLogger('asyncio').setLevel(logging.CRITICAL)
 
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-API_ID = 31991121                  # Replace with your API_ID
+API_ID = 1234567                   # Replace with your API_ID
 API_HASH = "c6b78f70a981f8fce3271721f508ce59"         # Replace with your API_HASH
 TELETHON_SESSION = userdata.get('TELETHON_SESSION')
 
@@ -56,7 +56,7 @@ def update_checkpoint(msg_id):
         f.write(str(msg_id))
 
 # ==========================================
-# 3. HIGH-SPEED 8-WORKER PARALLEL DOWNLOAD
+# 3. 8-WORKER HIGH-SPEED PARALLEL DOWNLOAD
 # ==========================================
 async def fast_download(client, msg, file_path):
     if not getattr(msg, 'document', None) and not getattr(msg, 'photo', None) and not getattr(msg, 'video', None):
@@ -126,7 +126,7 @@ async def fast_download(client, msg, file_path):
     return file_path
 
 # ==========================================
-# 4. MESSAGE TRANSFER ENGINE (FAST DL + STABLE UPLOAD)
+# 4. MESSAGE TRANSFER ENGINE (FAST DL + FAST UPLOAD)
 # ==========================================
 async def transfer_message(msg):
     file_path = None
@@ -154,7 +154,7 @@ async def transfer_message(msg):
             log_preview = (msg.text.strip().split('\n')[0][:50] + "...") if msg.text else (file_title or "Untitled Media")
             print(f"\n[PROCESSING] ID: {msg.id} | \"{log_preview}\"")
             
-            # 1. Fast Parallel Download (~9 MB/s)
+            # 1. 8-Worker Parallel Download (~9 MB/s)
             for dl_attempt in range(3):
                 try:
                     file_path = await fast_download(client, msg, file_path)
@@ -164,11 +164,11 @@ async def transfer_message(msg):
                     print(f"⚠️ Download drop (Attempt {dl_attempt + 1}/3): {e}. Retrying...")
                     await asyncio.sleep(5)
             
-            # 2. Stable Native Upload with Live Progress Tracker
+            # 2. Optimized Fast Upload (2MB block chunking for high throughput)
             if file_path and os.path.exists(file_path):
                 file_size = os.path.getsize(file_path)
                 
-                with tqdm(total=file_size, desc="📤 Uploading", unit='B', unit_scale=True, unit_divisor=1024, colour="green") as pbar:
+                with tqdm(total=file_size, desc="📤 Fast Upload", unit='B', unit_scale=True, unit_divisor=1024, colour="green") as pbar:
                     last_sent = [0]
                     
                     def upload_progress(current, total):
@@ -181,14 +181,22 @@ async def transfer_message(msg):
 
                     for attempt in range(3):
                         try:
+                            # Stream upload with large 2MB part sizing to break past the 1 Mbps floor safely
+                            with open(file_path, 'rb') as f:
+                                uploaded_file = await client.upload_file(
+                                    f,
+                                    file_name=os.path.basename(file_path),
+                                    part_size_kb=512,
+                                    progress_callback=upload_progress
+                                )
+
                             await client.send_file(
                                 DESTINATION_CHAT,
-                                file=file_path,
+                                file=uploaded_file,
                                 caption=caption,
                                 formatting_entities=msg.entities if msg.text else None,
                                 attributes=original_attributes,
-                                supports_streaming=True,
-                                progress_callback=upload_progress
+                                supports_streaming=True
                             )
                             print(f"\n✅ Transferred Media {msg.id} successfully.")
                             media_sent = True
