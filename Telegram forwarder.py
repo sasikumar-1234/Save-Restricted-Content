@@ -57,7 +57,7 @@ def update_checkpoint(msg_id):
         f.write(str(msg_id))
 
 # ==========================================
-# 1. YOUR EXACT ORIGINAL FAST DOWNLOADER
+# 1. FAST DOWNLOADER (+ ANTI-BAN PROTECTED)
 # ==========================================
 async def fast_download(client, msg, file_path):
     if not getattr(msg, 'document', None) and not getattr(msg, 'photo', None) and not getattr(msg, 'video', None):
@@ -94,6 +94,10 @@ async def fast_download(client, msg, file_path):
                         pbar.update(len(chunk))
                         break
                     break
+                # FIXED: Added explicit FloodWaitError protection
+                except errors.FloodWaitError as e:
+                    if attempt == 4: raise e
+                    await asyncio.sleep(e.seconds + 1)
                 except Exception as e:
                     if attempt == 4: raise e
                     await asyncio.sleep(2)
@@ -115,7 +119,7 @@ async def fast_download(client, msg, file_path):
     return file_path
 
 # ==========================================
-# 2. YOUR EXACT ORIGINAL PARALLEL UPLOADER
+# 2. PARALLEL UPLOADER (+ ANTI-BAN PROTECTED)
 # ==========================================
 async def safe_parallel_upload(client, file_path, workers=4):
     file_size = os.path.getsize(file_path)
@@ -126,7 +130,6 @@ async def safe_parallel_upload(client, file_path, workers=4):
     chunk_size = 512 * 1024
     total_parts = (file_size + chunk_size - 1) // chunk_size
 
-    # FIX: Native Python 64-bit signed integer generation (Bypasses Telethon version issues)
     file_id = int.from_bytes(os.urandom(8), byteorder='little', signed=True)
 
     semaphore = asyncio.Semaphore(workers)
@@ -146,6 +149,10 @@ async def safe_parallel_upload(client, file_path, workers=4):
                     ))
                     uploaded_bytes[0] += len(chunk_data)
                     return True
+            # FIXED: Added explicit FloodWaitError protection
+            except errors.FloodWaitError as e:
+                if attempt == 4: raise e
+                await asyncio.sleep(e.seconds + 1)
             except Exception as e:
                 if attempt == 4: raise e
                 await asyncio.sleep(1.5 ** attempt)
@@ -221,7 +228,6 @@ async def transfer_bundle(msgs):
                     await asyncio.sleep(5)
 
             if current_file_path and os.path.exists(current_file_path):
-                # Call YOUR exact original parallel uploader
                 uploaded_file = await safe_parallel_upload(client, current_file_path, workers=4)
                 uploaded_media.append(uploaded_file)
                 captions.append(msg.text or "")
@@ -232,7 +238,6 @@ async def transfer_bundle(msgs):
         if uploaded_media:
             for send_attempt in range(5):
                 try:
-                    # Single items keep their exact original video attributes (resolves streaming issues)
                     if len(uploaded_media) == 1:
                         await client.send_file(
                             DESTINATION_CHAT,
