@@ -6,7 +6,7 @@ import logging
 from google.colab import userdata, drive
 import nest_asyncio
 
-print("🔄 Ensuring required libraries are installed...")
+print("🔄 Ensuring required dependencies are installed...")
 subprocess.check_call([sys.executable, "-m", "pip", "install", "telethon", "cryptg", "tqdm", "nest_asyncio", "-q"])
 
 import cryptg
@@ -23,8 +23,8 @@ drive.mount('/content/drive')
 logging.getLogger('telethon').setLevel(logging.ERROR)
 logging.getLogger('asyncio').setLevel(logging.CRITICAL)
 
-API_ID = 31991121                 # Replace with your API_ID
-API_HASH = "c6b78f70a981f8fce3271721f508ce59"       # Replace with your API_HASH
+API_ID =          # Replace with your API_ID
+API_HASH = " " # Replace with your API_HASH
 TELETHON_SESSION = userdata.get('TELETHON_SESSION')
 
 SOURCE_CHAT = -1002320221806
@@ -57,7 +57,7 @@ def update_checkpoint(msg_id):
         f.write(str(msg_id))
 
 # ==========================================
-# 1. YOUR 8-WORKER HIGH-SPEED DOWNLOADER
+# 1. YOUR EXACT ORIGINAL FAST DOWNLOADER
 # ==========================================
 async def fast_download(client, msg, file_path):
     if not getattr(msg, 'document', None) and not getattr(msg, 'photo', None) and not getattr(msg, 'video', None):
@@ -115,23 +115,23 @@ async def fast_download(client, msg, file_path):
     return file_path
 
 # ==========================================
-# 2. DEADLOCK-FREE PARALLEL UPLOADER (FIXED)
+# 2. YOUR EXACT ORIGINAL PARALLEL UPLOADER
 # ==========================================
 async def safe_parallel_upload(client, file_path, workers=4):
     file_size = os.path.getsize(file_path)
-    
-    if file_size < 15 * 1024 * 1024: 
+
+    if file_size < 15 * 1024 * 1024:
         return await client.upload_file(file_path)
 
-    chunk_size = 512 * 1024  
+    chunk_size = 512 * 1024
     total_parts = (file_size + chunk_size - 1) // chunk_size
-    
+
     # FIX: Native Python 64-bit signed integer generation (Bypasses Telethon version issues)
     file_id = int.from_bytes(os.urandom(8), byteorder='little', signed=True)
-    
+
     semaphore = asyncio.Semaphore(workers)
     uploaded_bytes = [0]
-    
+
     async def upload_part(part_index):
         for attempt in range(5):
             try:
@@ -139,19 +139,19 @@ async def safe_parallel_upload(client, file_path, workers=4):
                     with open(file_path, 'rb') as f:
                         f.seek(part_index * chunk_size)
                         chunk_data = f.read(chunk_size)
-                        
+
                     await client(functions.upload.SaveBigFilePartRequest(
-                        file_id=file_id, file_part=part_index, 
+                        file_id=file_id, file_part=part_index,
                         file_total_parts=total_parts, bytes=chunk_data
                     ))
                     uploaded_bytes[0] += len(chunk_data)
                     return True
             except Exception as e:
                 if attempt == 4: raise e
-                await asyncio.sleep(1.5 ** attempt) 
-                
+                await asyncio.sleep(1.5 ** attempt)
+
     tasks = [upload_part(i) for i in range(total_parts)]
-    
+
     with tqdm(total=file_size, desc="📤 Parallel Upload", unit='B', unit_scale=True, colour="green") as pbar:
         async def update_bar():
             last_val = 0
@@ -160,82 +160,114 @@ async def safe_parallel_upload(client, file_path, workers=4):
                 last_val = uploaded_bytes[0]
                 await asyncio.sleep(0.5)
             pbar.update(uploaded_bytes[0] - last_val)
-            
+
         bar_task = asyncio.create_task(update_bar())
         try: await asyncio.gather(*tasks)
         finally: bar_task.cancel()
-            
-    return types.InputFileBig(id=file_id, parts=total_parts, name=os.path.basename(file_path))
-# ==========================================
-# 3. TRANSFER ENGINE
-# ==========================================
-async def transfer_message(msg):
-    file_path = None
-    media_sent = False
-    
-    try:
-        if getattr(msg, 'action', None):
-            return True
 
-        if getattr(msg, 'media', None):
+    return types.InputFileBig(id=file_id, parts=total_parts, name=os.path.basename(file_path))
+
+# ==========================================
+# 3. 1:1 ALBUM-AWARE TRANSFER ENGINE
+# ==========================================
+async def transfer_bundle(msgs):
+    uploaded_media = []
+    captions = []
+    original_attributes = []
+    current_file_path = None
+
+    try:
+        for msg in msgs:
+            if getattr(msg, 'action', None):
+                continue
+
+            if not getattr(msg, 'media', None):
+                for send_attempt in range(5):
+                    try:
+                        await client.send_message(DESTINATION_CHAT, msg.text, formatting_entities=msg.entities)
+                        print(f"✅ Transferred Text {msg.id}")
+                        break
+                    except errors.FloodWaitError as e:
+                        await asyncio.sleep(e.seconds + 1)
+                    except Exception as e:
+                        if send_attempt == 4: raise e
+                        await asyncio.sleep(2)
+                continue
+
             file_title = getattr(getattr(msg, 'file', None), 'name', None)
             if not file_title and hasattr(msg, 'document') and msg.document:
                 for attr in msg.document.attributes:
                     if hasattr(attr, 'title') and attr.title: file_title = attr.title; break
                     elif hasattr(attr, 'file_name') and attr.file_name: file_title = attr.file_name; break
 
-            caption = msg.text or file_title or ""
-            fallback_ext = msg.file.ext if hasattr(msg, 'file') and msg.file else '.mp4'
-            file_title_fallback = file_title or f"media_{msg.id}{fallback_ext}"
-            file_path = os.path.join(os.getcwd(), file_title_fallback)
-            
-            log_preview = (msg.text.strip().split('\n')[0][:50] + "...") if msg.text else file_title_fallback
-            print(f"\n[PROCESSING] ID: {msg.id} | \"{log_preview}\"")
+            ext = utils.get_extension(msg.media) or '.mp4'
+            file_title_fallback = file_title or f"media_{msg.id}{ext}"
+            current_file_path = os.path.join(os.getcwd(), file_title_fallback)
 
-            # Execute Your Download Block
+            # Preserve original video formatting/streaming attributes
+            attr = msg.document.attributes if getattr(msg, 'document', None) else None
+            original_attributes.append(attr)
+
+            log_preview = (msg.text.strip().split('\n')[0][:40] + "...") if msg.text else file_title_fallback
+            lbl = "ALBUM PART" if len(msgs) > 1 else "SINGLE"
+            print(f"\n[{lbl}] ID: {msg.id} | \"{log_preview}\"")
+
             for dl_attempt in range(3):
                 try:
-                    file_path = await fast_download(client, msg, file_path)
-                    if file_path and os.path.exists(file_path): break
+                    current_file_path = await fast_download(client, msg, current_file_path)
+                    if current_file_path and os.path.exists(current_file_path): break
                 except Exception as e:
-                    print(f"⚠️ Download drop (Attempt {dl_attempt + 1}/3): {e}. Retrying...")
+                    print(f"⚠️ DL drop (Attempt {dl_attempt + 1}/3): {e}. Retrying...")
                     await asyncio.sleep(5)
 
-            # Execute Deadlock-Free Upload Block
-            if os.path.exists(file_path):
-                original_attributes = msg.document.attributes if getattr(msg, 'document', None) else None
-                
-                uploaded_file = await safe_parallel_upload(client, file_path, workers=4)
-                
-                await client.send_file(
-                    DESTINATION_CHAT,
-                    file=uploaded_file,
-                    caption=caption,
-                    formatting_entities=msg.entities,
-                    attributes=original_attributes,
-                    supports_streaming=True
-                )
-                print(f"✅ Transferred Media {msg.id} successfully.")
-                media_sent = True
+            if current_file_path and os.path.exists(current_file_path):
+                # Call YOUR exact original parallel uploader
+                uploaded_file = await safe_parallel_upload(client, current_file_path, workers=4)
+                uploaded_media.append(uploaded_file)
+                captions.append(msg.text or "")
 
-        if not media_sent and msg.text:
-            await client.send_message(DESTINATION_CHAT, msg.text, formatting_entities=msg.entities)
-            print(f"✅ Transferred Text {msg.id}")
-            
+                os.remove(current_file_path)
+                current_file_path = None
+
+        if uploaded_media:
+            for send_attempt in range(5):
+                try:
+                    # Single items keep their exact original video attributes (resolves streaming issues)
+                    if len(uploaded_media) == 1:
+                        await client.send_file(
+                            DESTINATION_CHAT,
+                            file=uploaded_media[0],
+                            caption=captions[0],
+                            formatting_entities=msgs[0].entities,
+                            attributes=original_attributes[0],
+                            supports_streaming=True
+                        )
+                    else:
+                        await client.send_file(
+                            DESTINATION_CHAT,
+                            file=uploaded_media,
+                            caption=captions,
+                            supports_streaming=True
+                        )
+
+                    log_id = msgs[0].id if len(msgs) == 1 else f"{msgs[0].id}-{msgs[-1].id}"
+                    print(f"✅ Successfully Committed Media {log_id}")
+                    break
+                except errors.FloodWaitError as e:
+                    print(f"⏳ [RATE LIMIT] Pausing for {e.seconds}s...")
+                    await asyncio.sleep(e.seconds + 1)
+                except Exception as e:
+                    if send_attempt == 4: raise e
+                    await asyncio.sleep(3)
         return True
 
-    except errors.FloodWaitError as e:
-        print(f"\n⏳ [RATE LIMIT] Pausing for {e.seconds}s...")
-        await asyncio.sleep(e.seconds)
-        return False 
-        
     except Exception as e:
-        print(f"\n❌ [ERROR] ID {msg.id}: {e}")
+        print(f"\n❌ [FATAL ERROR] Bundle failed at ID {msgs[0].id}: {e}")
         return False
-        
+
     finally:
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
+        if current_file_path and os.path.exists(current_file_path):
+            os.remove(current_file_path)
 
 # ==========================================
 # 4. EXECUTION PIPELINE
@@ -246,25 +278,48 @@ async def run_clone():
     print(f"🚀 Connected. Resuming from ID {last_id}")
 
     count = 0
+    buffer = []
+    current_group = None
     kwargs = {'reverse': True, 'min_id': last_id}
-    if TOPIC_ID:
-        kwargs['reply_to'] = TOPIC_ID
+    if TOPIC_ID: kwargs['reply_to'] = TOPIC_ID
 
     async for msg in client.iter_messages(SOURCE_CHAT, **kwargs):
-        if msg.id == TOPIC_ID: 
-            continue
-            
-        success = await transfer_message(msg)
-        if success:
+        if msg.id == TOPIC_ID: continue
+
+        if msg.grouped_id:
+            if current_group == msg.grouped_id:
+                buffer.append(msg)
+            else:
+                if buffer:
+                    success = await transfer_bundle(buffer)
+                    if not success: break
+                    update_checkpoint(buffer[-1].id)
+                    count += len(buffer)
+                buffer = [msg]
+                current_group = msg.grouped_id
+        else:
+            if buffer:
+                success = await transfer_bundle(buffer)
+                if not success: break
+                update_checkpoint(buffer[-1].id)
+                count += len(buffer)
+                buffer = []
+                current_group = None
+
+            success = await transfer_bundle([msg])
+            if not success: break
             update_checkpoint(msg.id)
             count += 1
-        else:
-            print("⚠️ Pipeline paused. Will retry ID on next run.")
-            break
-            
+
         await asyncio.sleep(1.0)
 
-    print(f"\n🎉 Clone complete. Transferred {count} new items.")
+    if buffer:
+        success = await transfer_bundle(buffer)
+        if success:
+            update_checkpoint(buffer[-1].id)
+            count += len(buffer)
+
+    print(f"\n🎉 Clone sequence terminated. Transferred {count} items.")
     await client.disconnect()
 
 await run_clone()
