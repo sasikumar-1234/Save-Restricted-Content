@@ -3,6 +3,7 @@ import subprocess
 import os
 import asyncio
 import logging
+import random
 from google.colab import userdata, drive
 import nest_asyncio
 
@@ -23,8 +24,8 @@ drive.mount('/content/drive')
 logging.getLogger('telethon').setLevel(logging.ERROR)
 logging.getLogger('asyncio').setLevel(logging.CRITICAL)
 
-API_ID =          # Replace with your API_ID
-API_HASH = " " # Replace with your API_HASH
+API_ID =           # Replace with your API_ID
+API_HASH = "  " # Replace with your API_HASH
 TELETHON_SESSION = userdata.get('TELETHON_SESSION')
 
 SOURCE_CHAT = -1002320221806
@@ -94,7 +95,6 @@ async def fast_download(client, msg, file_path):
                         pbar.update(len(chunk))
                         break
                     break
-                # FIXED: Added explicit FloodWaitError protection
                 except errors.FloodWaitError as e:
                     if attempt == 4: raise e
                     await asyncio.sleep(e.seconds + 1)
@@ -149,7 +149,6 @@ async def safe_parallel_upload(client, file_path, workers=4):
                     ))
                     uploaded_bytes[0] += len(chunk_data)
                     return True
-            # FIXED: Added explicit FloodWaitError protection
             except errors.FloodWaitError as e:
                 if attempt == 4: raise e
                 await asyncio.sleep(e.seconds + 1)
@@ -182,6 +181,7 @@ async def transfer_bundle(msgs):
     captions = []
     original_attributes = []
     current_file_path = None
+    bundle_bytes_added = 0
 
     try:
         for msg in msgs:
@@ -211,7 +211,6 @@ async def transfer_bundle(msgs):
             file_title_fallback = file_title or f"media_{msg.id}{ext}"
             current_file_path = os.path.join(os.getcwd(), file_title_fallback)
 
-            # Preserve original video formatting/streaming attributes
             attr = msg.document.attributes if getattr(msg, 'document', None) else None
             original_attributes.append(attr)
 
@@ -228,9 +227,11 @@ async def transfer_bundle(msgs):
                     await asyncio.sleep(5)
 
             if current_file_path and os.path.exists(current_file_path):
+                file_size = os.path.getsize(current_file_path)
                 uploaded_file = await safe_parallel_upload(client, current_file_path, workers=4)
                 uploaded_media.append(uploaded_file)
                 captions.append(msg.text or "")
+                bundle_bytes_added += file_size
 
                 os.remove(current_file_path)
                 current_file_path = None
@@ -264,67 +265,107 @@ async def transfer_bundle(msgs):
                 except Exception as e:
                     if send_attempt == 4: raise e
                     await asyncio.sleep(3)
-        return True
+
+        return True, bundle_bytes_added
 
     except Exception as e:
         print(f"\n❌ [FATAL ERROR] Bundle failed at ID {msgs[0].id}: {e}")
-        return False
+        return False, 0
 
     finally:
         if current_file_path and os.path.exists(current_file_path):
             os.remove(current_file_path)
 
 # ==========================================
-# 4. EXECUTION PIPELINE
+# 4. EXECUTION PIPELINE (WITH DETAILED SAFETY LOGS)
 # ==========================================
 async def run_clone():
     await client.start()
     last_id = get_last_processed_id()
     print(f"🚀 Connected. Resuming from ID {last_id}")
 
-    count = 0
+    items_count = 0
+    total_bytes_today = 0
+    DAILY_LIMIT_GB = 40
+    DAILY_LIMIT_BYTES = DAILY_LIMIT_GB * 1024 * 1024 * 1024
+
     buffer = []
     current_group = None
     kwargs = {'reverse': True, 'min_id': last_id}
     if TOPIC_ID: kwargs['reply_to'] = TOPIC_ID
 
+    print(f"🛡️ [ANTI-BAN ACTIVE] Daily Volume Ceiling set to: {DAILY_LIMIT_GB} GB")
+    print(f"🛡️ [ANTI-BAN ACTIVE] Jitter pacing and 15-file milestone breaks enabled.\n")
+
     async for msg in client.iter_messages(SOURCE_CHAT, **kwargs):
         if msg.id == TOPIC_ID: continue
+
+        # --- SAFETY CIRCUIT BREAKER (40 GB VOLUME LIMIT) ---
+        if total_bytes_today >= DAILY_LIMIT_BYTES:
+            print(f"\n🛑 [SAFETY LOCK TRIGGERED] Daily volume limit of {DAILY_LIMIT_GB} GB has been reached.")
+            print(f"📊 Total transferred this session: {total_bytes_today / (1024**3):.2f} GB.")
+            print("🛡️ Gracefully exiting to protect your 2-year account trust score. Run again tomorrow!")
+            break
 
         if msg.grouped_id:
             if current_group == msg.grouped_id:
                 buffer.append(msg)
             else:
                 if buffer:
-                    success = await transfer_bundle(buffer)
-                    if not success: break
+                    success, bytes_added = await transfer_bundle(buffer)
+                    if not success:
+                        print("❌ Bundle transfer failed. Breaking loop safely.")
+                        break
                     update_checkpoint(buffer[-1].id)
-                    count += len(buffer)
+                    items_count += len(buffer)
+                    total_bytes_today += bytes_added
+                    print(f"📊 [PROGRESS] Items: {items_count} | Volume: {total_bytes_today / (1024**3):.2f} GB / {DAILY_LIMIT_GB} GB")
                 buffer = [msg]
                 current_group = msg.grouped_id
         else:
             if buffer:
-                success = await transfer_bundle(buffer)
-                if not success: break
+                success, bytes_added = await transfer_bundle(buffer)
+                if not success:
+                    print("❌ Bundle transfer failed. Breaking loop safely.")
+                    break
                 update_checkpoint(buffer[-1].id)
-                count += len(buffer)
+                items_count += len(buffer)
+                total_bytes_today += bytes_added
                 buffer = []
                 current_group = None
+                print(f"📊 [PROGRESS] Items: {items_count} | Volume: {total_bytes_today / (1024**3):.2f} GB / {DAILY_LIMIT_GB} GB")
 
-            success = await transfer_bundle([msg])
-            if not success: break
+            success, bytes_added = await transfer_bundle([msg])
+            if not success:
+                print("❌ Single item transfer failed. Breaking loop safely.")
+                break
             update_checkpoint(msg.id)
-            count += 1
+            items_count += 1
+            total_bytes_today += bytes_added
+            print(f"📊 [PROGRESS] Items: {items_count} | Volume: {total_bytes_today / (1024**3):.2f} GB / {DAILY_LIMIT_GB} GB")
 
-        await asyncio.sleep(1.0)
+        # --- DEFENSE 1: BATCH MILESTONE PAUSES (WITH LOGS) ---
+        if items_count > 0 and items_count % 15 == 0:
+            pause_time = random.randint(30, 45)
+            print(f"\n☕ [MILESTONE PAUSE] Completed {items_count} items. Resting for {pause_time}s to simulate human workflow...")
+            await asyncio.sleep(pause_time)
+            print(f"🔄 Resuming transfer pipeline...")
 
-    if buffer:
-        success = await transfer_bundle(buffer)
+        # --- DEFENSE 2: RANDOMIZED SLEEP JITTER (WITH LOGS) ---
+        jitter_delay = random.uniform(2.5, 5.5)
+        print(f"💤 [JITTER] Pacing delay applied: {jitter_delay:.2f}s")
+        await asyncio.sleep(jitter_delay)
+
+    if buffer and total_bytes_today < DAILY_LIMIT_BYTES:
+        success, bytes_added = await transfer_bundle(buffer)
         if success:
             update_checkpoint(buffer[-1].id)
-            count += len(buffer)
+            items_count += len(buffer)
+            total_bytes_today += bytes_added
 
-    print(f"\n🎉 Clone sequence terminated. Transferred {count} items.")
+    print(f"\n🎉 Session terminated successfully.")
+    print(f"📈 Total items processed: {items_count}")
+    print(f"📦 Total data pushed today: {total_bytes_today / (1024**3):.2f} GB")
     await client.disconnect()
 
 await run_clone()
