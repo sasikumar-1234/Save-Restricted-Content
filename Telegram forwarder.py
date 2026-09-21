@@ -33,7 +33,7 @@ logging.getLogger('telethon').setLevel(logging.ERROR)
 logging.getLogger('asyncio').setLevel(logging.CRITICAL)
 
 API_ID =         # Replace with your API_ID
-API_HASH = " "     # Replace with your API_HASH
+API_HASH = ""     # Replace with your API_HASH
 TELETHON_SESSION = userdata.get('TELETHON_SESSION')
 BOT_SESSION_STRING = " "
 
@@ -97,11 +97,11 @@ def cleanup_temp_files():
 # ==========================================
 user_client = TelegramClient(
     StringSession(TELETHON_SESSION), API_ID, API_HASH,
-    connection_retries=None, request_retries=5, flood_sleep_threshold=120
+    connection_retries=None, request_retries=10, flood_sleep_threshold=120
 )
 bot_client = TelegramClient(
     StringSession(BOT_SESSION_STRING), API_ID, API_HASH,
-    connection_retries=None, request_retries=5, flood_sleep_threshold=120
+    connection_retries=None, request_retries=10, flood_sleep_threshold=120
 )
 
 # ==========================================
@@ -158,123 +158,54 @@ async def process_large_video(file_path):
     return processed_segments
 
 # ==========================================
-# 4. BULLETPROOF I/O ENGINE
+# 4. NATIVE, DOCUMENTATION-COMPLIANT I/O ENGINE
 # ==========================================
-async def fast_download(client, msg, file_path):
-    if not getattr(msg, 'document', None) and not getattr(msg, 'photo', None) and not getattr(msg, 'video', None):
-        return await client.download_media(msg, file=file_path)
-
+async def native_download(client, msg, file_path):
     file_size = getattr(msg.document, 'size', getattr(msg.video, 'size', 0)) if hasattr(msg, 'document') or hasattr(msg, 'video') else 0
-    if file_size == 0: return None # Guard against empty server voids
+    if file_size == 0 and not getattr(msg, 'photo', None): return None 
     
-    if getattr(msg, 'photo', None) or file_size < 5 * 1024 * 1024:
-        return await client.download_media(msg, file=file_path)
-
-    WORKERS = 16
-    chunk_size = 1024 * 1024
-    total_chunks = (file_size + chunk_size - 1) // chunk_size
     filename = os.path.basename(file_path)
-
-    # Restored visual UI print
     print(f"\n[BUFFER DOWNLOAD] ID {msg.id} | {filename}")
 
-    if os.path.exists(file_path): os.remove(file_path)
-    with open(file_path, "wb") as f: f.truncate(file_size)
+    desc_text = f"📥 DL: {filename[:15]}..."
     
-    fd = os.open(file_path, os.O_WRONLY)
-    try:
-        # Added filename to progress bar
-        desc_text = f"📥 DL: {filename[:15]}..."
-        with tqdm(total=file_size, desc=desc_text, unit='B', unit_scale=True, unit_divisor=1024, colour="blue", position=0, leave=False, dynamic_ncols=True) as pbar:
-            async def download_chunk(worker_id, chunk_index):
-                offset = chunk_index * chunk_size
-                limit = min(chunk_size, file_size - offset)
-                for attempt in range(10):
-                    try:
-                        async def fetch_with_timeout():
-                            async for chunk in client.iter_download(msg.media, offset=offset, limit=limit, chunk_size=chunk_size):
-                                os.pwrite(fd, chunk, offset)
-                                pbar.update(len(chunk))
-                                update_activity()
-                                break
-                        await asyncio.wait_for(fetch_with_timeout(), timeout=8.0)
-                        break
-                    except asyncio.TimeoutError:
-                        if attempt == 9: raise Exception("Chunk timed out repeatedly.")
-                        await asyncio.sleep(0.5 + random.uniform(0.1, 0.4))
-                    except Exception as e:
-                        if attempt == 9: raise e
-                        await asyncio.sleep(0.5 + random.uniform(0.1, 0.4))
+    with tqdm(total=file_size, desc=desc_text, unit='B', unit_scale=True, unit_divisor=1024, colour="blue", position=0, leave=False, dynamic_ncols=True) as pbar:
+        async def progress_callback(current, total):
+            pbar.n = current
+            pbar.update(0)
+            update_activity()
 
-            queue = asyncio.Queue()
-            for i in range(total_chunks): queue.put_nowait(i)
+        for attempt in range(5):
+            try:
+                # Telethon natively handles chunk sizing and MTProto pacing with cryptg speed
+                await client.download_media(msg, file=file_path, progress_callback=progress_callback)
+                return file_path
+            except Exception as e:
+                if attempt == 4: raise e
+                print(f"\n⚠️ DL Interrupted ({e}). Retrying ({attempt+1}/5)...")
+                if os.path.exists(file_path): os.remove(file_path)
+                await asyncio.sleep(2.0 ** attempt + random.uniform(0.1, 0.5))
 
-            async def worker(worker_id):
-                while not queue.empty() and not shutdown_event.is_set():
-                    try: chunk_index = queue.get_nowait()
-                    except asyncio.QueueEmpty: break
-                    await download_chunk(worker_id, chunk_index)
-                    queue.task_done()
-
-            tasks = [asyncio.create_task(worker(i)) for i in range(WORKERS)]
-            await asyncio.gather(*tasks)
-    finally:
-        os.close(fd)
-
-    return file_path
-
-async def safe_parallel_upload(file_path, concurrency=8):
+async def native_upload(client, file_path):
     file_size = os.path.getsize(file_path)
     filename = os.path.basename(file_path)
-    
-    # Patched: Added retry loop for small files
-    if file_size < 15 * 1024 * 1024:
-        for attempt in range(5):
-            try:
-                return await bot_client.upload_file(file_path)
-            except Exception as e:
-                if attempt == 4: raise e
-                await asyncio.sleep((1.5 ** attempt) + random.uniform(0.1, 0.5))
-
-    chunk_size = 512 * 1024
-    total_parts = (file_size + chunk_size - 1) // chunk_size
-    file_id = int.from_bytes(os.urandom(8), byteorder='little', signed=True)
-    semaphore = asyncio.Semaphore(concurrency)
-    uploaded_bytes = [0]
-
-    async def upload_part(part_index):
-        for attempt in range(5):
-            try:
-                async with semaphore:
-                    with open(file_path, 'rb') as f:
-                        f.seek(part_index * chunk_size)
-                        chunk_data = f.read(chunk_size)
-                    await bot_client(functions.upload.SaveBigFilePartRequest(
-                        file_id=file_id, file_part=part_index,
-                        file_total_parts=total_parts, bytes=chunk_data
-                    ))
-                    uploaded_bytes[0] += len(chunk_data)
-                    update_activity()
-                    return True
-            except Exception as e:
-                if attempt == 4: raise e
-                await asyncio.sleep((1.5 ** attempt) + random.uniform(0.1, 0.5))
-
     desc_text = f"📤 UP: {filename[:15]}..."
-    tasks = [upload_part(i) for i in range(total_parts)]
-    with tqdm(total=file_size, desc=desc_text, unit='B', unit_scale=True, unit_divisor=1024, colour="green", position=1, leave=False, dynamic_ncols=True) as pbar:
-        async def update_bar():
-            last_val = 0
-            while uploaded_bytes[0] < file_size and not shutdown_event.is_set():
-                pbar.update(uploaded_bytes[0] - last_val)
-                last_val = uploaded_bytes[0]
-                await asyncio.sleep(0.5)
-            pbar.update(uploaded_bytes[0] - last_val)
-        bar_task = asyncio.create_task(update_bar())
-        try: await asyncio.gather(*tasks)
-        finally: bar_task.cancel()
 
-    return types.InputFileBig(id=file_id, parts=total_parts, name=filename)
+    with tqdm(total=file_size, desc=desc_text, unit='B', unit_scale=True, unit_divisor=1024, colour="green", position=1, leave=False, dynamic_ncols=True) as pbar:
+        async def progress_callback(current, total):
+            pbar.n = current
+            pbar.update(0)
+            update_activity()
+
+        for attempt in range(5):
+            try:
+                # Natively handles SaveBigFilePart concurrency safely
+                uploaded_file = await client.upload_file(file_path, part_size_kb=512, progress_callback=progress_callback)
+                return uploaded_file
+            except Exception as e:
+                if attempt == 4: raise e
+                print(f"\n⚠️ UP Interrupted ({e}). Retrying ({attempt+1}/5)...")
+                await asyncio.sleep(2.0 ** attempt + random.uniform(0.1, 0.5))
 
 # ==========================================
 # 5. PIPELINE & COORDINATION
@@ -307,17 +238,10 @@ async def prepare_bundle_data(msgs):
                 else: thumb_path = None
             except Exception: thumb_path = None
 
-        dl_ok = False
-        for dl_attempt in range(3):
-            try:
-                current_file_path = await fast_download(user_client, msg, current_file_path)
-                if current_file_path and os.path.exists(current_file_path):
-                    dl_ok = True
-                    break
-            except Exception:
-                await asyncio.sleep(3)
-
-        if dl_ok:
+        # Replaced custom downloader with the reliable native downloader
+        current_file_path = await native_download(user_client, msg, current_file_path)
+        
+        if current_file_path and os.path.exists(current_file_path):
             segments = await process_large_video(current_file_path)
             prepared_items.append({"msg": msg, "is_text": False, "segments": segments, "thumb_path": thumb_path})
 
@@ -387,7 +311,9 @@ async def consumer(queue, state):
 
                 for idx, (seg_file, dur, w, h) in enumerate(item["segments"]):
                     f_size = os.path.getsize(seg_file)
-                    uploaded_file = await safe_parallel_upload(seg_file, concurrency=8)
+                    
+                    # Replaced custom uploader with the reliable native uploader
+                    uploaded_file = await native_upload(bot_client, seg_file)
                     uploaded_media.append(uploaded_file)
                     
                     raw_caption = msg.text if idx == 0 else ""
@@ -429,11 +355,13 @@ async def consumer(queue, state):
             log_id = msgs[0].id if len(msgs) == 1 else f"{msgs[0].id}-{msgs[-1].id}"
             print(f"✅ [COMMITTED] ID {log_id} | Session Total: {state['daily_bytes'] / (1024**3):.2f} GB")
             
+            # 15-File Milestone Break Preserved
             if items_count > 0 and items_count % 15 == 0:
                 rest = random.randint(30, 45)
                 print(f"☕ Milestone break ({rest}s)...")
                 await asyncio.sleep(rest)
             
+            # Standard Per-File Delay Preserved
             await asyncio.sleep(random.uniform(2.5, 5.5))
 
         except Exception as e:
@@ -518,7 +446,6 @@ async def master_loop():
                 await asyncio.sleep(sleep_seconds)
                 print("🌅 New day started. Waking up and resuming...")
                 
-        # Guard 3: Patched to prevent infinite loop on revoked auth tokens
         except (AuthKeyError, UnauthorizedError) as e:
             print(f"\n🛑 FATAL AUTH ERROR: {e}. Session revoked or banned. Stopping script.")
             break
