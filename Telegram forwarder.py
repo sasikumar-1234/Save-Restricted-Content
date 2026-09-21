@@ -24,13 +24,22 @@ drive.mount('/content/drive')
 logging.getLogger('telethon').setLevel(logging.ERROR)
 logging.getLogger('asyncio').setLevel(logging.CRITICAL)
 
-API_ID =           # Replace with your API_ID
-API_HASH = "  " # Replace with your API_HASH
+API_ID =         # Replace with your API_ID
+API_HASH = "  "     # Replace with your API_HASH
 TELETHON_SESSION = userdata.get('TELETHON_SESSION')
 
-SOURCE_CHAT = -1002320221806
-DESTINATION_CHAT = -1003846210054
-TOPIC_ID = 261
+# --- SOURCE & DESTINATION CONFIGURATION ---
+SOURCE_INPUT = "-1002320221806_261" # Source (Forum Topic)
+DESTINATION_CHAT = -1003846210054    # Destination (Plain Private Channel)
+
+if "_" in str(SOURCE_INPUT):
+    chat_part, topic_part = str(SOURCE_INPUT).split("_")
+    SOURCE_CHAT = int(chat_part)
+    TOPIC_ID = int(topic_part)
+else:
+    SOURCE_CHAT = int(SOURCE_INPUT)
+    TOPIC_ID = None
+# ------------------------------------------
 
 CHECKPOINT_DIR = "/content/drive/MyDrive/TelegramClones"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -73,8 +82,7 @@ async def fast_download(client, msg, file_path):
     chunk_size = 512 * 1024
     total_chunks = (file_size + chunk_size - 1) // chunk_size
 
-    if os.path.exists(file_path):
-        os.remove(file_path)
+    if os.path.exists(file_path): os.remove(file_path)
 
     with open(file_path, "wb") as f:
         f.truncate(file_size)
@@ -83,12 +91,9 @@ async def fast_download(client, msg, file_path):
         async def download_chunk(worker_id, chunk_index):
             offset = chunk_index * chunk_size
             limit = min(chunk_size, file_size - offset)
-
             for attempt in range(5):
                 try:
-                    async for chunk in client.iter_download(
-                        msg.media, offset=offset, limit=limit, chunk_size=chunk_size
-                    ):
+                    async for chunk in client.iter_download(msg.media, offset=offset, limit=limit, chunk_size=chunk_size):
                         with open(file_path, "r+b") as f:
                             f.seek(offset)
                             f.write(chunk)
@@ -103,8 +108,7 @@ async def fast_download(client, msg, file_path):
                     await asyncio.sleep(2)
 
         queue = asyncio.Queue()
-        for i in range(total_chunks):
-            queue.put_nowait(i)
+        for i in range(total_chunks): queue.put_nowait(i)
 
         async def worker(worker_id):
             while not queue.empty():
@@ -123,13 +127,11 @@ async def fast_download(client, msg, file_path):
 # ==========================================
 async def safe_parallel_upload(client, file_path, workers=4):
     file_size = os.path.getsize(file_path)
-
     if file_size < 15 * 1024 * 1024:
         return await client.upload_file(file_path)
 
     chunk_size = 512 * 1024
     total_parts = (file_size + chunk_size - 1) // chunk_size
-
     file_id = int.from_bytes(os.urandom(8), byteorder='little', signed=True)
 
     semaphore = asyncio.Semaphore(workers)
@@ -180,6 +182,7 @@ async def transfer_bundle(msgs):
     uploaded_media = []
     captions = []
     original_attributes = []
+    thumb_paths = []
     current_file_path = None
     bundle_bytes_added = 0
 
@@ -191,6 +194,7 @@ async def transfer_bundle(msgs):
             if not getattr(msg, 'media', None):
                 for send_attempt in range(5):
                     try:
+                        # Plain channel destination: no reply_to needed.
                         await client.send_message(DESTINATION_CHAT, msg.text, formatting_entities=msg.entities)
                         print(f"✅ Transferred Text {msg.id}")
                         break
@@ -211,6 +215,17 @@ async def transfer_bundle(msgs):
             file_title_fallback = file_title or f"media_{msg.id}{ext}"
             current_file_path = os.path.join(os.getcwd(), file_title_fallback)
 
+            # --- EXTRACT THUMBNAIL ---
+            thumb_path = None
+            if hasattr(msg, 'document') and msg.document and getattr(msg.document, 'thumbs', None):
+                thumb_path = current_file_path + "_thumb.jpg"
+                try:
+                    await client.download_media(msg, file=thumb_path, thumb=-1)
+                    if not os.path.exists(thumb_path): thumb_path = None
+                except Exception:
+                    thumb_path = None
+            # -------------------------
+
             attr = msg.document.attributes if getattr(msg, 'document', None) else None
             original_attributes.append(attr)
 
@@ -229,8 +244,10 @@ async def transfer_bundle(msgs):
             if current_file_path and os.path.exists(current_file_path):
                 file_size = os.path.getsize(current_file_path)
                 uploaded_file = await safe_parallel_upload(client, current_file_path, workers=4)
+
                 uploaded_media.append(uploaded_file)
                 captions.append(msg.text or "")
+                thumb_paths.append(thumb_path)
                 bundle_bytes_added += file_size
 
                 os.remove(current_file_path)
@@ -246,14 +263,16 @@ async def transfer_bundle(msgs):
                             caption=captions[0],
                             formatting_entities=msgs[0].entities,
                             attributes=original_attributes[0],
-                            supports_streaming=True
+                            supports_streaming=True,
+                            thumb=thumb_paths[0]
                         )
                     else:
                         await client.send_file(
                             DESTINATION_CHAT,
                             file=uploaded_media,
                             caption=captions,
-                            supports_streaming=True
+                            supports_streaming=True,
+                            thumb=thumb_paths
                         )
 
                     log_id = msgs[0].id if len(msgs) == 1 else f"{msgs[0].id}-{msgs[-1].id}"
@@ -275,6 +294,9 @@ async def transfer_bundle(msgs):
     finally:
         if current_file_path and os.path.exists(current_file_path):
             os.remove(current_file_path)
+        for t in thumb_paths:
+            if t and os.path.exists(t):
+                os.remove(t)
 
 # ==========================================
 # 4. EXECUTION PIPELINE (WITH DETAILED SAFETY LOGS)
@@ -299,6 +321,14 @@ async def run_clone():
 
     async for msg in client.iter_messages(SOURCE_CHAT, **kwargs):
         if msg.id == TOPIC_ID: continue
+
+        # --- THE ULTIMATE CLUTTER FILTER ---
+        if (msg.sticker or msg.gif or msg.audio or msg.voice or
+            msg.video_note or msg.poll or msg.dice or
+            msg.contact or msg.geo or msg.game):
+            print(f"⏩ [SKIPPED] Ignoring clutter/unwanted media type at ID {msg.id}")
+            continue
+        # -----------------------------------
 
         # --- SAFETY CIRCUIT BREAKER (40 GB VOLUME LIMIT) ---
         if total_bytes_today >= DAILY_LIMIT_BYTES:
@@ -344,14 +374,14 @@ async def run_clone():
             total_bytes_today += bytes_added
             print(f"📊 [PROGRESS] Items: {items_count} | Volume: {total_bytes_today / (1024**3):.2f} GB / {DAILY_LIMIT_GB} GB")
 
-        # --- DEFENSE 1: BATCH MILESTONE PAUSES (WITH LOGS) ---
+        # --- DEFENSE 1: BATCH MILESTONE PAUSES ---
         if items_count > 0 and items_count % 15 == 0:
             pause_time = random.randint(30, 45)
             print(f"\n☕ [MILESTONE PAUSE] Completed {items_count} items. Resting for {pause_time}s to simulate human workflow...")
             await asyncio.sleep(pause_time)
             print(f"🔄 Resuming transfer pipeline...")
 
-        # --- DEFENSE 2: RANDOMIZED SLEEP JITTER (WITH LOGS) ---
+        # --- DEFENSE 2: RANDOMIZED SLEEP JITTER ---
         jitter_delay = random.uniform(2.5, 5.5)
         print(f"💤 [JITTER] Pacing delay applied: {jitter_delay:.2f}s")
         await asyncio.sleep(jitter_delay)
