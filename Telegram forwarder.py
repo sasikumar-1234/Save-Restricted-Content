@@ -4,19 +4,23 @@ import os
 import asyncio
 import logging
 import random
+import json
+import math
 from google.colab import userdata, drive
 import nest_asyncio
 
-print("🔄 Ensuring required dependencies are installed...")
+print("🔄 Step 1: Installing Python dependencies and FFmpeg for video processing...")
 subprocess.check_call([sys.executable, "-m", "pip", "install", "telethon", "cryptg", "tqdm", "nest_asyncio", "-q"])
+subprocess.check_call(["apt-get", "update", "-qq"])
+subprocess.check_call(["apt-get", "install", "-y", "ffmpeg", "-qq"])
 
 import cryptg
 from telethon import TelegramClient, errors, functions, types, utils
-from telethon.sessions import StringSession
+from telethon.sessions import StringSession, MemorySession
 from tqdm.asyncio import tqdm
 
 # ==========================================
-# 0. SETUP & MOUNT
+# 0. SETUP, MOUNT & CREDENTIALS
 # ==========================================
 nest_asyncio.apply()
 drive.mount('/content/drive')
@@ -27,9 +31,10 @@ logging.getLogger('asyncio').setLevel(logging.CRITICAL)
 API_ID =         # Replace with your API_ID
 API_HASH = "  "     # Replace with your API_HASH
 TELETHON_SESSION = userdata.get('TELETHON_SESSION')
+BOT_TOKEN = " "    # Replace with your Bot API Token from @BotFather
 
 # --- SOURCE & DESTINATION CONFIGURATION ---
-SOURCE_INPUT = "-1002320221806_261" # Source (Forum Topic)
+SOURCE_INPUT = "-1002320221806_943"  # Source (Forum Topic)
 DESTINATION_CHAT = -1003846210054    # Destination (Plain Private Channel)
 
 if "_" in str(SOURCE_INPUT):
@@ -41,34 +46,71 @@ else:
     TOPIC_ID = None
 # ------------------------------------------
 
-CHECKPOINT_DIR = "/content/drive/MyDrive/TelegramClones"
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-CHECKPOINT_FILE = os.path.join(CHECKPOINT_DIR, f"checkpoint_{abs(SOURCE_CHAT)}_{TOPIC_ID or 'channel'}.txt")
+# --- JSON STATE QUEUE ---
+QUEUE_DIR = "/content/drive/MyDrive/Migration_Queue"
+os.makedirs(QUEUE_DIR, exist_ok=True)
+STATE_FILE = os.path.join(QUEUE_DIR, f"state_{abs(SOURCE_CHAT)}_{TOPIC_ID or 'channel'}.json")
 
-client = TelegramClient(
-    StringSession(TELETHON_SESSION),
-    API_ID,
-    API_HASH,
-    connection_retries=100,
-    request_retries=100,
-    timeout=60
-)
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    return {"last_id": 0, "daily_bytes": 0, "failed_ids": []}
 
-def get_last_processed_id():
-    if os.path.exists(CHECKPOINT_FILE):
-        with open(CHECKPOINT_FILE, "r") as f:
-            content = f.read().strip()
-            if content.isdigit():
-                return int(content)
-    return 0
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
 
-def update_checkpoint(msg_id):
-    with open(CHECKPOINT_FILE, "w") as f:
-        f.write(str(msg_id))
+# --- DUAL-SESSION INITIALIZATION ---
+user_client = TelegramClient(StringSession(TELETHON_SESSION), API_ID, API_HASH)
+bot_client = TelegramClient('MemorySession()', API_ID, API_HASH)
 
 # ==========================================
-# 1. FAST DOWNLOADER (+ ANTI-BAN PROTECTED)
+# 1. FFmpeg SEGMENTER & FAST DOWNLOADER
 # ==========================================
+def get_video_duration(file_path):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
+    try: return float(result.stdout.strip())
+    except ValueError: return 0
+
+async def process_large_video(file_path):
+    file_size = os.path.getsize(file_path)
+    limit = 1.95 * 1024 * 1024 * 1024  # 1.95GB Threshold to stay safely under 2GB
+
+    if file_size <= limit:
+        return [file_path] # No slicing needed
+
+    print(f"\n✂️ [FFMPEG] File exceeds 1.95GB ({file_size/(1024**3):.2f} GB). Slicing via -c copy...")
+    duration = get_video_duration(file_path)
+    if duration == 0:
+        print("⚠️ Could not read duration, attempting raw upload (may fail).")
+        return [file_path]
+
+    parts_needed = math.ceil(file_size / limit)
+    segment_time = math.ceil(duration / parts_needed)
+
+    base_name, ext = os.path.splitext(file_path)
+    output_pattern = f"{base_name}_part%03d{ext}"
+
+    # Execute zero-encoding stream copy
+    subprocess.run([
+        "ffmpeg", "-i", file_path, "-c", "copy", "-map", "0",
+        "-segment_time", str(segment_time), "-f", "segment",
+        "-reset_timestamps", "1", output_pattern, "-y"
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    os.remove(file_path) # Delete massive original to save Colab disk space
+
+    split_files = sorted([os.path.join(os.path.dirname(file_path), f)
+                          for f in os.listdir(os.path.dirname(file_path))
+                          if f.startswith(os.path.basename(base_name) + "_part")])
+
+    print(f"✅ [FFMPEG] Sliced into {len(split_files)} playable segments.")
+    return split_files
+
 async def fast_download(client, msg, file_path):
     if not getattr(msg, 'document', None) and not getattr(msg, 'photo', None) and not getattr(msg, 'video', None):
         return await client.download_media(msg, file=file_path)
@@ -87,7 +129,7 @@ async def fast_download(client, msg, file_path):
     with open(file_path, "wb") as f:
         f.truncate(file_size)
 
-    with tqdm(total=file_size, desc="📥 Downloading", unit='B', unit_scale=True, unit_divisor=1024, colour="blue") as pbar:
+    with tqdm(total=file_size, desc="📥 User Reading", unit='B', unit_scale=True, unit_divisor=1024, colour="blue") as pbar:
         async def download_chunk(worker_id, chunk_index):
             offset = chunk_index * chunk_size
             limit = min(chunk_size, file_size - offset)
@@ -123,7 +165,7 @@ async def fast_download(client, msg, file_path):
     return file_path
 
 # ==========================================
-# 2. PARALLEL UPLOADER (+ ANTI-BAN PROTECTED)
+# 2. PARALLEL UPLOADER (BOT CLIENT)
 # ==========================================
 async def safe_parallel_upload(client, file_path, workers=4):
     file_size = os.path.getsize(file_path)
@@ -160,7 +202,7 @@ async def safe_parallel_upload(client, file_path, workers=4):
 
     tasks = [upload_part(i) for i in range(total_parts)]
 
-    with tqdm(total=file_size, desc="📤 Parallel Upload", unit='B', unit_scale=True, colour="green") as pbar:
+    with tqdm(total=file_size, desc="📤 Bot Writing", unit='B', unit_scale=True, colour="green") as pbar:
         async def update_bar():
             last_val = 0
             while uploaded_bytes[0] < file_size:
@@ -178,7 +220,7 @@ async def safe_parallel_upload(client, file_path, workers=4):
 # ==========================================
 # 3. 1:1 ALBUM-AWARE TRANSFER ENGINE
 # ==========================================
-async def transfer_bundle(msgs):
+async def transfer_bundle(msgs, state):
     uploaded_media = []
     captions = []
     original_attributes = []
@@ -194,9 +236,9 @@ async def transfer_bundle(msgs):
             if not getattr(msg, 'media', None):
                 for send_attempt in range(5):
                     try:
-                        # Plain channel destination: no reply_to needed.
-                        await client.send_message(DESTINATION_CHAT, msg.text, formatting_entities=msg.entities)
-                        print(f"✅ Transferred Text {msg.id}")
+                        # USING BOT CLIENT for text
+                        await bot_client.send_message(DESTINATION_CHAT, msg.text, formatting_entities=msg.entities)
+                        print(f"✅ [BOT] Transferred Text {msg.id}")
                         break
                     except errors.FloodWaitError as e:
                         await asyncio.sleep(e.seconds + 1)
@@ -215,19 +257,18 @@ async def transfer_bundle(msgs):
             file_title_fallback = file_title or f"media_{msg.id}{ext}"
             current_file_path = os.path.join(os.getcwd(), file_title_fallback)
 
-            # --- EXTRACT THUMBNAIL ---
+            # --- EXTRACT THUMBNAIL (Via User) ---
             thumb_path = None
             if hasattr(msg, 'document') and msg.document and getattr(msg.document, 'thumbs', None):
                 thumb_path = current_file_path + "_thumb.jpg"
                 try:
-                    await client.download_media(msg, file=thumb_path, thumb=-1)
+                    await user_client.download_media(msg, file=thumb_path, thumb=-1)
                     if not os.path.exists(thumb_path): thumb_path = None
                 except Exception:
                     thumb_path = None
             # -------------------------
 
             attr = msg.document.attributes if getattr(msg, 'document', None) else None
-            original_attributes.append(attr)
 
             log_preview = (msg.text.strip().split('\n')[0][:40] + "...") if msg.text else file_title_fallback
             lbl = "ALBUM PART" if len(msgs) > 1 else "SINGLE"
@@ -235,29 +276,41 @@ async def transfer_bundle(msgs):
 
             for dl_attempt in range(3):
                 try:
-                    current_file_path = await fast_download(client, msg, current_file_path)
+                    # USING USER CLIENT for reading
+                    current_file_path = await fast_download(user_client, msg, current_file_path)
                     if current_file_path and os.path.exists(current_file_path): break
                 except Exception as e:
                     print(f"⚠️ DL drop (Attempt {dl_attempt + 1}/3): {e}. Retrying...")
                     await asyncio.sleep(5)
 
             if current_file_path and os.path.exists(current_file_path):
-                file_size = os.path.getsize(current_file_path)
-                uploaded_file = await safe_parallel_upload(client, current_file_path, workers=4)
+                # Check size and slice if necessary (O(N) segmentation)
+                segmented_files = await process_large_video(current_file_path)
 
-                uploaded_media.append(uploaded_file)
-                captions.append(msg.text or "")
-                thumb_paths.append(thumb_path)
-                bundle_bytes_added += file_size
+                for index, seg_file in enumerate(segmented_files):
+                    file_size = os.path.getsize(seg_file)
 
-                os.remove(current_file_path)
+                    # USING BOT CLIENT for writing/uploading
+                    uploaded_file = await safe_parallel_upload(bot_client, seg_file, workers=8)
+
+                    uploaded_media.append(uploaded_file)
+                    original_attributes.append(attr)
+                    thumb_paths.append(thumb_path)
+
+                    # Apply caption only to the first part if the video was sliced
+                    captions.append(msg.text if index == 0 else "")
+                    bundle_bytes_added += file_size
+
+                    os.remove(seg_file) # Immediate cleanup
+
                 current_file_path = None
 
         if uploaded_media:
             for send_attempt in range(5):
                 try:
+                    # USING BOT CLIENT to push the final bundle
                     if len(uploaded_media) == 1:
-                        await client.send_file(
+                        await bot_client.send_file(
                             DESTINATION_CHAT,
                             file=uploaded_media[0],
                             caption=captions[0],
@@ -267,7 +320,7 @@ async def transfer_bundle(msgs):
                             thumb=thumb_paths[0]
                         )
                     else:
-                        await client.send_file(
+                        await bot_client.send_file(
                             DESTINATION_CHAT,
                             file=uploaded_media,
                             caption=captions,
@@ -276,10 +329,10 @@ async def transfer_bundle(msgs):
                         )
 
                     log_id = msgs[0].id if len(msgs) == 1 else f"{msgs[0].id}-{msgs[-1].id}"
-                    print(f"✅ Successfully Committed Media {log_id}")
+                    print(f"✅ [BOT] Successfully Committed Media {log_id}")
                     break
                 except errors.FloodWaitError as e:
-                    print(f"⏳ [RATE LIMIT] Pausing for {e.seconds}s...")
+                    print(f"⏳ [BOT RATE LIMIT] Pausing for {e.seconds}s...")
                     await asyncio.sleep(e.seconds + 1)
                 except Exception as e:
                     if send_attempt == 4: raise e
@@ -299,15 +352,18 @@ async def transfer_bundle(msgs):
                 os.remove(t)
 
 # ==========================================
-# 4. EXECUTION PIPELINE (WITH DETAILED SAFETY LOGS)
+# 4. EXECUTION PIPELINE (JSON QUEUE & SAFETY LOGS)
 # ==========================================
 async def run_clone():
-    await client.start()
-    last_id = get_last_processed_id()
-    print(f"🚀 Connected. Resuming from ID {last_id}")
+    print("🚀 Authenticating Dual-Session...")
+    await user_client.start()
+    await bot_client.start(bot_token=BOT_TOKEN)
+
+    state = load_state()
+    last_id = state["last_id"]
+    print(f"📂 JSON State Loaded. Resuming from ID {last_id}")
 
     items_count = 0
-    total_bytes_today = 0
     DAILY_LIMIT_GB = 40
     DAILY_LIMIT_BYTES = DAILY_LIMIT_GB * 1024 * 1024 * 1024
 
@@ -316,25 +372,29 @@ async def run_clone():
     kwargs = {'reverse': True, 'min_id': last_id}
     if TOPIC_ID: kwargs['reply_to'] = TOPIC_ID
 
-    print(f"🛡️ [ANTI-BAN ACTIVE] Daily Volume Ceiling set to: {DAILY_LIMIT_GB} GB")
-    print(f"🛡️ [ANTI-BAN ACTIVE] Jitter pacing and 15-file milestone breaks enabled.\n")
+    print(f"🛡️ [ANTI-BAN ACTIVE] Bot Uploads & Jitter pacing enabled.\n")
 
-    async for msg in client.iter_messages(SOURCE_CHAT, **kwargs):
+    # READING VIA USER
+    async for msg in user_client.iter_messages(SOURCE_CHAT, **kwargs):
         if msg.id == TOPIC_ID: continue
 
-        # --- THE ULTIMATE CLUTTER FILTER ---
+        # Skip permanently failed items to prevent infinite loops
+        if msg.id in state.get("failed_ids", []):
+            print(f"⏩ [SKIPPED] Ignoring previously failed ID {msg.id}")
+            continue
+
+        # --- CLUTTER FILTER ---
         if (msg.sticker or msg.gif or msg.audio or msg.voice or
             msg.video_note or msg.poll or msg.dice or
             msg.contact or msg.geo or msg.game):
-            print(f"⏩ [SKIPPED] Ignoring clutter/unwanted media type at ID {msg.id}")
+            print(f"⏩ [SKIPPED] Clutter/unwanted media type at ID {msg.id}")
             continue
-        # -----------------------------------
+        # ----------------------
 
-        # --- SAFETY CIRCUIT BREAKER (40 GB VOLUME LIMIT) ---
-        if total_bytes_today >= DAILY_LIMIT_BYTES:
-            print(f"\n🛑 [SAFETY LOCK TRIGGERED] Daily volume limit of {DAILY_LIMIT_GB} GB has been reached.")
-            print(f"📊 Total transferred this session: {total_bytes_today / (1024**3):.2f} GB.")
-            print("🛡️ Gracefully exiting to protect your 2-year account trust score. Run again tomorrow!")
+        # --- SAFETY CIRCUIT BREAKER ---
+        if state["daily_bytes"] >= DAILY_LIMIT_BYTES:
+            print(f"\n🛑 [SAFETY LOCK TRIGGERED] Daily volume limit of {DAILY_LIMIT_GB} GB reached.")
+            print(f"📊 Total pushed today: {state['daily_bytes'] / (1024**3):.2f} GB.")
             break
 
         if msg.grouped_id:
@@ -342,60 +402,67 @@ async def run_clone():
                 buffer.append(msg)
             else:
                 if buffer:
-                    success, bytes_added = await transfer_bundle(buffer)
+                    success, bytes_added = await transfer_bundle(buffer, state)
                     if not success:
-                        print("❌ Bundle transfer failed. Breaking loop safely.")
+                        state["failed_ids"].append(buffer[0].id)
+                        save_state(state)
                         break
-                    update_checkpoint(buffer[-1].id)
+                    state["last_id"] = buffer[-1].id
+                    state["daily_bytes"] += bytes_added
+                    save_state(state)
                     items_count += len(buffer)
-                    total_bytes_today += bytes_added
-                    print(f"📊 [PROGRESS] Items: {items_count} | Volume: {total_bytes_today / (1024**3):.2f} GB / {DAILY_LIMIT_GB} GB")
+                    print(f"📊 [JSON SAVED] Items: {items_count} | Vol: {state['daily_bytes'] / (1024**3):.2f} GB")
                 buffer = [msg]
                 current_group = msg.grouped_id
         else:
             if buffer:
-                success, bytes_added = await transfer_bundle(buffer)
+                success, bytes_added = await transfer_bundle(buffer, state)
                 if not success:
-                    print("❌ Bundle transfer failed. Breaking loop safely.")
+                    state["failed_ids"].append(buffer[0].id)
+                    save_state(state)
                     break
-                update_checkpoint(buffer[-1].id)
+                state["last_id"] = buffer[-1].id
+                state["daily_bytes"] += bytes_added
+                save_state(state)
                 items_count += len(buffer)
-                total_bytes_today += bytes_added
                 buffer = []
                 current_group = None
-                print(f"📊 [PROGRESS] Items: {items_count} | Volume: {total_bytes_today / (1024**3):.2f} GB / {DAILY_LIMIT_GB} GB")
 
-            success, bytes_added = await transfer_bundle([msg])
+            success, bytes_added = await transfer_bundle([msg], state)
             if not success:
-                print("❌ Single item transfer failed. Breaking loop safely.")
+                if "failed_ids" not in state: state["failed_ids"] = []
+                state["failed_ids"].append(msg.id)
+                save_state(state)
                 break
-            update_checkpoint(msg.id)
+            state["last_id"] = msg.id
+            state["daily_bytes"] += bytes_added
+            save_state(state)
             items_count += 1
-            total_bytes_today += bytes_added
-            print(f"📊 [PROGRESS] Items: {items_count} | Volume: {total_bytes_today / (1024**3):.2f} GB / {DAILY_LIMIT_GB} GB")
+            print(f"📊 [JSON SAVED] Items: {items_count} | Vol: {state['daily_bytes'] / (1024**3):.2f} GB")
 
-        # --- DEFENSE 1: BATCH MILESTONE PAUSES ---
+        # --- DEFENSE 1: MILESTONE PAUSES ---
         if items_count > 0 and items_count % 15 == 0:
             pause_time = random.randint(30, 45)
-            print(f"\n☕ [MILESTONE PAUSE] Completed {items_count} items. Resting for {pause_time}s to simulate human workflow...")
+            print(f"\n☕ [MILESTONE] Resting for {pause_time}s to clear API queue...")
             await asyncio.sleep(pause_time)
-            print(f"🔄 Resuming transfer pipeline...")
 
-        # --- DEFENSE 2: RANDOMIZED SLEEP JITTER ---
-        jitter_delay = random.uniform(2.5, 5.5)
-        print(f"💤 [JITTER] Pacing delay applied: {jitter_delay:.2f}s")
-        await asyncio.sleep(jitter_delay)
+        # --- DEFENSE 2: JITTER ---
+        await asyncio.sleep(random.uniform(2.5, 5.5))
 
-    if buffer and total_bytes_today < DAILY_LIMIT_BYTES:
-        success, bytes_added = await transfer_bundle(buffer)
+    # Catch remaining buffer if loop ends
+    if buffer and state["daily_bytes"] < DAILY_LIMIT_BYTES:
+        success, bytes_added = await transfer_bundle(buffer, state)
         if success:
-            update_checkpoint(buffer[-1].id)
+            state["last_id"] = buffer[-1].id
+            state["daily_bytes"] += bytes_added
+            save_state(state)
             items_count += len(buffer)
-            total_bytes_today += bytes_added
 
-    print(f"\n🎉 Session terminated successfully.")
-    print(f"📈 Total items processed: {items_count}")
-    print(f"📦 Total data pushed today: {total_bytes_today / (1024**3):.2f} GB")
-    await client.disconnect()
+    print(f"\n🎉 Session terminated securely.")
+    print(f"📈 Total items processed this run: {items_count}")
+    print(f"📦 Total data pushed today: {state['daily_bytes'] / (1024**3):.2f} GB")
+
+    await user_client.disconnect()
+    await bot_client.disconnect()
 
 await run_clone()
