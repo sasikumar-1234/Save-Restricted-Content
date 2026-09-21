@@ -1,3 +1,6 @@
+
+!pip install telethon cryptg tqdm nest_asyncio
+
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
