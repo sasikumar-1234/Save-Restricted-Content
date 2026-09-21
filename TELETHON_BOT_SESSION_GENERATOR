@@ -1,0 +1,13 @@
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+
+API_ID =      # Replace with yours
+API_HASH = "  "  # Replace with yours
+BOT_TOKEN = "  " # Replace with yours
+
+client = TelegramClient(StringSession(), API_ID, API_HASH)
+# This will log in once and generate your permanent string
+await client.start(bot_token=BOT_TOKEN)
+print("\n✅ SAVE THIS STRING:")
+print(client.session.save())
+await client.disconnect()
